@@ -1,0 +1,104 @@
+name: Fetch Cloud IPs (secret script)
+
+on:
+  schedule:
+    # 每天 18:00 UTC 运行（≈ SGT 次日 02:00）
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # 允许推送到当前仓库
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 从 Secret 还原脚本（请先在仓库 Secrets 中设置 FETCH_CLOUD_IPS_PY_B64）
+      - name: Restore script from secret
+        shell: bash
+        env:
+          FETCH_CLOUD_IPS_PY_B64: ${{ secrets.FETCH_CLOUD_IPS_PY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FETCH_CLOUD_IPS_PY_B64:-}" ]; then
+            echo "Missing secret: FETCH_CLOUD_IPS_PY_B64"
+            exit 1
+          fi
+          echo "${FETCH_CLOUD_IPS_PY_B64}" | base64 -d > fetch_cloud_ips.py
+          chmod +x fetch_cloud_ips.py
+          ls -la fetch_cloud_ips.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install requests
+
+      - name: Run script and generate outputs
+        run: |
+          set -euxo pipefail
+          rm -rf cloud-ip-cidr
+          mkdir -p cloud-ip-cidr
+          python3 fetch_cloud_ips.py --output-dir ./cloud-ip-cidr
+          echo "Output tree:"
+          ls -la cloud-ip-cidr || true
+
+      - name: Verify outputs (fail if empty)
+        run: |
+          set -euo pipefail
+          if [ ! -d cloud-ip-cidr ] || [ -z "$(ls -A cloud-ip-cidr)" ]; then
+            echo "cloud-ip-cidr is empty — script likely produced no files."
+            exit 1
+          fi
+
+      # 提交前删除脚本，避免入库
+      - name: Clean up secret script
+        if: always()
+        run: rm -f fetch_cloud_ips.py
+
+      # 关键修复：强制加入（即使被 .gitignore 忽略），并仅对已缓存的更改做比较
+      - name: Commit and push outputs to repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 配置身份
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 确定当前分支名
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          if [ -z "$BRANCH" ] || [ "$BRANCH" = "$GITHUB_REF" ]; then
+            BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          fi
+
+          # 强制把 cloud-ip-cidr 纳入版本控制（即使被 .gitignore 忽略）
+          git add -f cloud-ip-cidr
+
+          # 仅检查已暂存改动
+          if git diff --cached --quiet; then
+            echo "No staged changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(ci): update cloud-ip-cidr ($(date -u +'%Y-%m-%dT%H:%M:%SZ'))"
+          # 防止非 fast-forward，先 rebase 再推送
+          git pull --rebase origin "$BRANCH" || true
+          git push origin HEAD:"$BRANCH"
+
+      # artifact 仅用于下载查看；它会打包为 zip，不影响上面的提交
+      - name: Upload artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-ip-cidr
+          path: cloud-ip-cidr/
+          if-no-files-found: error
